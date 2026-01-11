@@ -3,14 +3,31 @@ import {
   AutoProcessor,
   RawImage,
   Tensor,
+  env,
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
+
+// ===============================
+// FORCE WASM BACKEND (IMPORTANT)
+// ===============================
+// Evita el error "no available backend found" cuando WebGPU no existe.
+env.allowLocalModels = false;
+
+// Fuerza uso de WASM (ONNX Runtime Web). Esto hace que NO dependa de WebGPU.
+env.backends = env.backends || {};
+env.backends.onnx = env.backends.onnx || {};
+env.backends.onnx.wasm = env.backends.onnx.wasm || {};
+
+// Opciones seguras
+env.backends.onnx.wasm.numThreads = 1;      // en móvil/portátil evita problemas
+env.backends.onnx.wasm.simd = true;         // si el navegador soporta SIMD, acelera
+env.backends.onnx.wasm.proxy = false;
 
 // ===============================
 // CONFIG
 // ===============================
 const AUTO_FLOOR_MODE = true;
 const FLOOR_Y_START = 0.45;
-const PROCESSOR_SIZE = 768;
+const PROCESSOR_SIZE = 640; // más seguro para WASM (sube a 768 si va fluido)
 
 // UI refs
 const statusLabel = document.getElementById("status");
@@ -48,14 +65,12 @@ function pickBestFloorMaskIndex(mask, numMasks) {
     let bottom = 0;
     let area = 0;
 
-    // bottom row
     const y = h - 1;
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
       if (mask.data[numMasks * i + m] === 1) bottom++;
     }
 
-    // total area
     for (let i = 0; i < w * h; i++) {
       if (mask.data[numMasks * i + m] === 1) area++;
     }
@@ -83,17 +98,9 @@ function updateMaskOverlay(mask, scores) {
   const pixelData = imageData.data;
 
   const numMasks = scores.length;
-  let bestIndex = 0;
+  let bestIndex = pickBestFloorMaskIndex(mask, numMasks);
 
-  if (AUTO_FLOOR_MODE) {
-    bestIndex = pickBestFloorMaskIndex(mask, numMasks);
-    statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)})`;
-  } else {
-    for (let i = 1; i < numMasks; ++i) {
-      if (scores[i] > scores[bestIndex]) bestIndex = i;
-    }
-    statusLabel.textContent = `Segment score: ${scores[bestIndex].toFixed(2)}`;
-  }
+  statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)})`;
 
   for (let i = 0; i < pixelData.length; ++i) {
     if (mask.data[numMasks * i + bestIndex] === 1) {
@@ -108,9 +115,6 @@ function updateMaskOverlay(mask, scores) {
   maskContext.putImageData(imageData, 0, 0);
 }
 
-// ===============================
-// Clear mask
-// ===============================
 function clearMask() {
   cutButton.disabled = true;
   maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
@@ -135,11 +139,9 @@ resetButton.addEventListener("click", () => {
 // Auto floor segmentation (box prompt)
 // ===============================
 async function autoFloorSegment(model, processor) {
-  if (!imageEmbeddings || !imageProcessed) return;
-
   statusLabel.textContent = "Auto-detecting floor...";
 
-  const reshaped = imageProcessed.reshaped_input_sizes[0]; // [h, w]
+  const reshaped = imageProcessed.reshaped_input_sizes[0];
   const H = reshaped[0];
   const W = reshaped[1];
 
@@ -192,10 +194,8 @@ async function encode(url, model, processor) {
   statusLabel.textContent = "Embedding extracted!";
   isEncoding = false;
 
-  if (AUTO_FLOOR_MODE) {
-    clearMask();
-    await autoFloorSegment(model, processor);
-  }
+  clearMask();
+  await autoFloorSegment(model, processor);
 }
 
 // Upload handlers
@@ -247,50 +247,22 @@ cutButton.addEventListener("click", async () => {
 });
 
 // ===============================
-// SMART MODEL LOADER (webgpu fp16 -> webgpu fp32 -> wasm fp32)
+// LOAD MODEL (WASM ONLY)
 // ===============================
 const model_id = "Xenova/slimsam-77-uniform";
-statusLabel.textContent = "Loading model...";
+statusLabel.textContent = "Loading model (WASM)...";
 
-async function loadModelSmart() {
-  // 1) WebGPU fp16
-  try {
-    const m = await SamModel.from_pretrained(model_id, {
-      dtype: "fp16",
-      device: "webgpu",
-    });
-    return { model: m, device: "webgpu", dtype: "fp16" };
-  } catch (e1) {
-    console.warn("WebGPU fp16 failed, trying WebGPU fp32...", e1);
-  }
+const model = await SamModel.from_pretrained(model_id, {
+  dtype: "fp32",
+  device: "wasm",
+});
 
-  // 2) WebGPU fp32
-  try {
-    const m = await SamModel.from_pretrained(model_id, {
-      dtype: "fp32",
-      device: "webgpu",
-    });
-    return { model: m, device: "webgpu", dtype: "fp32" };
-  } catch (e2) {
-    console.warn("WebGPU fp32 failed, trying WASM fp32...", e2);
-  }
-
-  // 3) WASM fp32 (CPU backend in browser)
-  const m = await SamModel.from_pretrained(model_id, {
-    dtype: "fp32",
-    device: "wasm",
-  });
-  return { model: m, device: "wasm", dtype: "fp32" };
-}
-
-const { model, device, dtype } = await loadModelSmart();
 const processor = await AutoProcessor.from_pretrained(model_id);
 
 window.__samModel = model;
 window.__samProcessor = processor;
 
-statusLabel.textContent = `Ready (${device}, ${dtype})`;
-
+statusLabel.textContent = "Ready (wasm, fp32)";
 fileUpload.disabled = false;
 uploadButton.style.opacity = 1;
 example.style.pointerEvents = "auto";
