@@ -7,7 +7,7 @@ import {
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
 
 // ===============================
-// FORCE WASM BACKEND (IMPORTANT)
+// FORCE WASM BACKEND
 // ===============================
 env.allowLocalModels = false;
 env.backends = env.backends || {};
@@ -18,11 +18,31 @@ env.backends.onnx.wasm.simd = true;
 env.backends.onnx.wasm.proxy = false;
 
 // ===============================
-// CONFIG
+// CONFIG (tuneable)
 // ===============================
-const AUTO_FLOOR_MODE = true;
-const FLOOR_Y_START = 0.45;
-const PROCESSOR_SIZE = 640; // seguro para WASM (sube a 768 si va fluido)
+
+// Si te pilla poco suelo, baja estos Y un poco (más hacia abajo).
+// Si te pilla cosas no suelo, sube negativos o añade más negativos.
+const PROCESSOR_SIZE = 640; // seguro WASM
+
+// Puntos POSITIVOS (sugerimos suelo) en coordenadas normalizadas [0..1]
+const POS_POINTS = [
+  [0.20, 0.78],
+  [0.50, 0.80],
+  [0.80, 0.78],
+  [0.20, 0.90],
+  [0.50, 0.92],
+  [0.80, 0.90],
+  [0.50, 0.98],
+];
+
+// Puntos NEGATIVOS (NO suelo) arriba (pared/techo)
+const NEG_POINTS = [
+  [0.20, 0.12],
+  [0.50, 0.12],
+  [0.80, 0.12],
+  [0.50, 0.30],
+];
 
 // UI refs
 const statusLabel = document.getElementById("status");
@@ -67,7 +87,7 @@ function pickBestFloorMaskIndex(mask, numMasks) {
       if (mask.data[numMasks * i + m] === 1) bottom++;
     }
 
-    // area
+    // total area
     for (let i = 0; i < w * h; i++) {
       if (mask.data[numMasks * i + m] === 1) area++;
     }
@@ -128,36 +148,49 @@ resetButton.addEventListener("click", () => {
 
   cutButton.disabled = true;
   imageContainer.style.backgroundImage = "none";
-  imageContainer.style.aspectRatio = ""; // reset
+  imageContainer.style.aspectRatio = "";
   uploadButton.style.display = "flex";
   statusLabel.textContent = "Ready";
 });
 
 // ===============================
-// Auto floor segmentation (box prompt + empty points)
+// Auto floor segmentation (AUTO POINTS)
 // ===============================
-async function autoFloorSegment(model, processor) {
-  statusLabel.textContent = "Auto-detecting floor...";
-
+function buildAutoPointsTensors() {
   const reshaped = imageProcessed.reshaped_input_sizes[0]; // [h, w]
   const H = reshaped[0];
   const W = reshaped[1];
 
-  const x0 = 0;
-  const y0 = Math.floor(H * FLOOR_Y_START);
-  const x1 = W - 1;
-  const y1 = H - 1;
+  // Convert normalized points to reshaped pixel coords
+  const pts = [];
+  const lbls = [];
 
-  const input_boxes = new Tensor("float32", [x0, y0, x1, y1], [1, 1, 2, 2]);
+  for (const [x, y] of POS_POINTS) {
+    pts.push(x * W, y * H);
+    lbls.push(1n); // positive
+  }
+  for (const [x, y] of NEG_POINTS) {
+    pts.push(x * W, y * H);
+    lbls.push(0n); // negative
+  }
 
-  // ✅ FIX: SlimSAM requiere input_points + input_labels siempre.
-  // Pasamos 0 puntos (tensores vacíos) para que no falle.
-  const input_points = new Tensor("float32", [], [1, 1, 0, 2]);
-  const input_labels = new Tensor("int64", [], [1, 1, 0]);
+  const num = lbls.length;
+
+  // SAM expects [1, 1, num_points, 2]
+  const input_points = new Tensor("float32", pts, [1, 1, num, 2]);
+  // labels: [1, 1, num_points]
+  const input_labels = new Tensor("int64", lbls, [1, 1, num]);
+
+  return { input_points, input_labels };
+}
+
+async function autoFloorSegment(model, processor) {
+  statusLabel.textContent = "Auto-detecting floor...";
+
+  const { input_points, input_labels } = buildAutoPointsTensors();
 
   const { pred_masks, iou_scores } = await model({
     ...imageEmbeddings,
-    input_boxes,
     input_points,
     input_labels,
   });
@@ -183,10 +216,10 @@ async function encode(url, model, processor) {
 
   imageInput = await RawImage.fromURL(url);
 
-  // ✅ Mantener proporciones (evita deformación en vertical/horizontal)
+  // Keep photo proportions (no deform)
   imageContainer.style.aspectRatio = `${imageInput.width} / ${imageInput.height}`;
-
   imageContainer.style.backgroundImage = `url(${url})`;
+
   uploadButton.style.display = "none";
   cutButton.disabled = true;
 
@@ -203,9 +236,7 @@ async function encode(url, model, processor) {
   isEncoding = false;
 
   clearMask();
-  if (AUTO_FLOOR_MODE) {
-    await autoFloorSegment(model, processor);
-  }
+  await autoFloorSegment(model, processor);
 }
 
 // Upload handlers
@@ -257,7 +288,7 @@ cutButton.addEventListener("click", async () => {
 });
 
 // ===============================
-// LOAD MODEL (WASM ONLY)
+// LOAD MODEL (WASM)
 // ===============================
 const model_id = "Xenova/slimsam-77-uniform";
 statusLabel.textContent = "Loading model (WASM)...";
