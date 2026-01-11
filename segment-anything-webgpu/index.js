@@ -6,10 +6,16 @@ import {
 } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.0";
 
 // ===============================
-// CONFIG (AJUSTA AQUÍ)
+// CONFIG
 // ===============================
-const AUTO_FLOOR_MODE = true; // Mantener true: sin clicks
-const FLOOR_Y_START = 0.45;   // 0.40-0.55: desde qué altura empieza la caja (más alto = más “solo suelo”)
+const AUTO_FLOOR_MODE = true; // true: automático, sin clicks
+const FLOOR_Y_START = 0.45;   // 0.40-0.55: desde qué altura empieza la caja del suelo
+
+// Si tu iPhone va justo, baja esto a 640.
+// Si quieres más calidad en portátil, sube a 1024.
+// OJO: esta opción puede no estar soportada por todas las versiones del processor.
+// Si no funciona, lo ignorará o dará error (en ese caso te digo alternativa).
+const PROCESSOR_SIZE = 768;
 
 // Reference the elements we will use
 const statusLabel = document.getElementById("status");
@@ -30,16 +36,18 @@ const EXAMPLE_URL =
 
 // State variables
 let isEncoding = false;
-let isDecoding = false;
-let decodePending = false;
-let lastPoints = null;
-let isMultiMaskMode = false;
 let imageInput = null;
 let imageProcessed = null;
 let imageEmbeddings = null;
 
+// Keep compatibility variables (not used in auto mode)
+let isDecoding = false;
+let decodePending = false;
+let lastPoints = null;
+let isMultiMaskMode = false;
+
 // ===============================
-// AUTO FLOOR: escoger la máscara que más “toca” el borde inferior
+// AUTO FLOOR: escoger máscara que más toca borde inferior
 // ===============================
 function pickBestFloorMaskIndex(mask, numMasks) {
   const w = mask.width;
@@ -53,14 +61,14 @@ function pickBestFloorMaskIndex(mask, numMasks) {
     let bottom = 0;
     let area = 0;
 
-    // Cuenta píxeles activos en la última fila (tocar borde inferior)
+    // bottom row pixels
     const y = h - 1;
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
       if (mask.data[numMasks * i + m] === 1) bottom++;
     }
 
-    // Área total (para desempate)
+    // total area
     for (let i = 0; i < w * h; i++) {
       if (mask.data[numMasks * i + m] === 1) area++;
     }
@@ -76,22 +84,18 @@ function pickBestFloorMaskIndex(mask, numMasks) {
 }
 
 // ===============================
-// DIBUJAR MÁSCARA
+// DRAW MASK
 // ===============================
 function updateMaskOverlay(mask, scores) {
-  // Update canvas dimensions (if different)
+  // Update canvas dimensions
   if (maskCanvas.width !== mask.width || maskCanvas.height !== mask.height) {
     maskCanvas.width = mask.width;
     maskCanvas.height = mask.height;
   }
 
-  // Allocate buffer for pixel data
-  const imageData = maskContext.createImageData(
-    maskCanvas.width,
-    maskCanvas.height,
-  );
+  const imageData = maskContext.createImageData(maskCanvas.width, maskCanvas.height);
+  const pixelData = imageData.data;
 
-  // Select best mask
   const numMasks = scores.length; // normalmente 3
   let bestIndex = 0;
 
@@ -99,51 +103,42 @@ function updateMaskOverlay(mask, scores) {
     bestIndex = pickBestFloorMaskIndex(mask, numMasks);
     statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)})`;
   } else {
+    // fallback: best iou
     for (let i = 1; i < numMasks; ++i) {
-      if (scores[i] > scores[bestIndex]) {
-        bestIndex = i;
-      }
+      if (scores[i] > scores[bestIndex]) bestIndex = i;
     }
     statusLabel.textContent = `Segment score: ${scores[bestIndex].toFixed(2)}`;
   }
 
-  // Fill mask with colour
-  const pixelData = imageData.data;
+  // Fill mask with colour (blue)
   for (let i = 0; i < pixelData.length; ++i) {
     if (mask.data[numMasks * i + bestIndex] === 1) {
       const offset = 4 * i;
-      pixelData[offset] = 0; // red
-      pixelData[offset + 1] = 114; // green
-      pixelData[offset + 2] = 189; // blue
-      pixelData[offset + 3] = 255; // alpha
+      pixelData[offset] = 0;
+      pixelData[offset + 1] = 114;
+      pixelData[offset + 2] = 189;
+      pixelData[offset + 3] = 255;
     }
   }
 
-  // Draw image data to context
   maskContext.putImageData(imageData, 0, 0);
 }
 
 // ===============================
-// LIMPIAR
+// CLEAR MASK
 // ===============================
 function clearPointsAndMask() {
-  // Reset state
   isMultiMaskMode = false;
   lastPoints = null;
 
-  // Remove points from previous mask (if any)
   document.querySelectorAll(".icon").forEach((e) => e.remove());
-
-  // Disable cut button
   cutButton.disabled = true;
 
-  // Reset mask canvas
   maskContext.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
 }
 clearButton.addEventListener("click", clearPointsAndMask);
 
 resetButton.addEventListener("click", () => {
-  // Reset the state
   imageInput = null;
   imageProcessed = null;
   imageEmbeddings = null;
@@ -151,10 +146,8 @@ resetButton.addEventListener("click", () => {
   isDecoding = false;
   decodePending = false;
 
-  // Clear points and mask (if present)
   clearPointsAndMask();
 
-  // Update UI
   cutButton.disabled = true;
   imageContainer.style.backgroundImage = "none";
   uploadButton.style.display = "flex";
@@ -162,80 +155,25 @@ resetButton.addEventListener("click", () => {
 });
 
 // ===============================
-// (Opcional) Decode por puntos: lo dejamos por compatibilidad, pero NO se usa en AUTO_FLOOR_MODE
+// AUTO FLOOR SEGMENTATION (box prompt)
 // ===============================
-async function decode() {
-  if (AUTO_FLOOR_MODE) return;
-
-  // Only proceed if we are not already decoding
-  if (isDecoding) {
-    decodePending = true;
-    return;
-  }
-  isDecoding = true;
-
-  // Prepare inputs for decoding
-  const reshaped = imageProcessed.reshaped_input_sizes[0];
-  const points = lastPoints
-    .map((x) => [x.position[0] * reshaped[1], x.position[1] * reshaped[0]])
-    .flat(Infinity);
-  const labels = lastPoints.map((x) => BigInt(x.label)).flat(Infinity);
-
-  const num_points = lastPoints.length;
-  const input_points = new Tensor("float32", points, [1, 1, num_points, 2]);
-  const input_labels = new Tensor("int64", labels, [1, 1, num_points]);
-
-  // Generate the mask
-  const { pred_masks, iou_scores } = await model({
-    ...imageEmbeddings,
-    input_points,
-    input_labels,
-  });
-
-  // Post-process the mask
-  const masks = await processor.post_process_masks(
-    pred_masks,
-    imageProcessed.original_sizes,
-    imageProcessed.reshaped_input_sizes,
-  );
-
-  isDecoding = false;
-
-  updateMaskOverlay(RawImage.fromTensor(masks[0][0]), iou_scores.data);
-
-  // Check if another decode is pending
-  if (decodePending) {
-    decodePending = false;
-    decode();
-  }
-}
-
-// ===============================
-// AUTO FLOOR: segmentar con caja inferior
-// ===============================
-async function autoFloorSegment() {
+async function autoFloorSegment(model, processor) {
   if (!imageEmbeddings || !imageProcessed) return;
 
   statusLabel.textContent = "Auto-detecting floor...";
 
-  // Tamaño reshaped (donde se pasan prompts a SAM)
   const reshaped = imageProcessed.reshaped_input_sizes[0]; // [h, w]
   const H = reshaped[0];
   const W = reshaped[1];
 
-  // Caja inferior
+  // box: full width, lower part
   const x0 = 0;
   const y0 = Math.floor(H * FLOOR_Y_START);
   const x1 = W - 1;
   const y1 = H - 1;
 
-  // SAM usa cajas como 2 puntos: [[x0,y0],[x1,y1]]
-  // Shape: [1, 1, 2, 2]
-  const input_boxes = new Tensor(
-    "float32",
-    [x0, y0, x1, y1],
-    [1, 1, 2, 2],
-  );
+  // SAM expects boxes as 2 points: [[x0,y0],[x1,y1]] => shape [1,1,2,2]
+  const input_boxes = new Tensor("float32", [x0, y0, x1, y1], [1, 1, 2, 2]);
 
   const { pred_masks, iou_scores } = await model({
     ...imageEmbeddings,
@@ -253,31 +191,37 @@ async function autoFloorSegment() {
 }
 
 // ===============================
-// ENCODE (subir imagen) + auto floor
+// ENCODE (upload) + auto segment
 // ===============================
-async function encode(url) {
+async function encode(url, model, processor) {
   if (isEncoding) return;
   isEncoding = true;
   statusLabel.textContent = "Extracting image embedding...";
 
   imageInput = await RawImage.fromURL(url);
 
-  // Update UI
+  // UI
   imageContainer.style.backgroundImage = `url(${url})`;
   uploadButton.style.display = "none";
   cutButton.disabled = true;
 
-  // Recompute image embeddings
-  imageProcessed = await processor(imageInput);
+  // Process + embeddings
+  try {
+    imageProcessed = await processor(imageInput, { size: PROCESSOR_SIZE });
+  } catch (e) {
+    // If processor doesn't support "size", fallback
+    console.warn("Processor size option not supported, using default.", e);
+    imageProcessed = await processor(imageInput);
+  }
+
   imageEmbeddings = await model.get_image_embeddings(imageProcessed);
 
   statusLabel.textContent = "Embedding extracted!";
   isEncoding = false;
 
-  // AUTO FLOOR
   if (AUTO_FLOOR_MODE) {
     clearPointsAndMask();
-    await autoFloorSegment();
+    await autoFloorSegment(model, processor);
   }
 }
 
@@ -287,106 +231,43 @@ fileUpload.addEventListener("change", function (e) {
   if (!file) return;
 
   const reader = new FileReader();
-
-  // Set up a callback when the file is loaded
-  reader.onload = (e2) => encode(e2.target.result);
-
+  reader.onload = (e2) => encode(e2.target.result, window.__samModel, window.__samProcessor);
   reader.readAsDataURL(file);
 });
 
 example.addEventListener("click", (e) => {
   e.preventDefault();
-  encode(EXAMPLE_URL);
+  encode(EXAMPLE_URL, window.__samModel, window.__samProcessor);
 });
 
-// ===============================
-// EVENTOS DE RATÓN: deshabilitados en AUTO_FLOOR_MODE
-// ===============================
-
-// Clamp a value inside a range [min, max]
-function clamp(x, min = 0, max = 1) {
-  return Math.max(Math.min(x, max), min);
-}
-
-function getPoint(e) {
-  // Get bounding box
-  const bb = imageContainer.getBoundingClientRect();
-
-  // Get the mouse coordinates relative to the container
-  const mouseX = clamp((e.clientX - bb.left) / bb.width);
-  const mouseY = clamp((e.clientY - bb.top) / bb.height);
-
-  return {
-    position: [mouseX, mouseY],
-    label:
-      e.button === 2 // right click
-        ? 0 // negative prompt
-        : 1, // positive prompt
-  };
-}
-
-imageContainer.addEventListener("mousedown", (e) => {
-  if (AUTO_FLOOR_MODE) return;
-
-  if (e.button !== 0 && e.button !== 2) return;
-  if (!imageEmbeddings) return;
-
-  if (!isMultiMaskMode) {
-    lastPoints = [];
-    isMultiMaskMode = true;
-    cutButton.disabled = false;
-  }
-
-  const point = getPoint(e);
-  lastPoints.push(point);
-
-  // add icon
-  const icon = (point.label === 1 ? starIcon : crossIcon).cloneNode();
-  icon.style.left = `${point.position[0] * 100}%`;
-  icon.style.top = `${point.position[1] * 100}%`;
-  imageContainer.appendChild(icon);
-
-  decode();
-});
-
+// Disable any mouse interactions (we don't want clicks)
 imageContainer.addEventListener("contextmenu", (e) => e.preventDefault());
 
-imageContainer.addEventListener("mousemove", (e) => {
-  if (AUTO_FLOOR_MODE) return;
-
-  if (!imageEmbeddings || isMultiMaskMode) return;
-  lastPoints = [getPoint(e)];
-  decode();
-});
-
-// Handle cut button click
+// Handle cut button click (downloads masked cut-out)
 cutButton.addEventListener("click", async () => {
   const [w, h] = [maskCanvas.width, maskCanvas.height];
 
-  // Get the mask pixel data (and use this as a buffer)
   const maskImageData = maskContext.getImageData(0, 0, w, h);
 
-  // Create a new canvas to hold the cut-out
   const cutCanvas = new OffscreenCanvas(w, h);
   const cutContext = cutCanvas.getContext("2d");
 
-  // Copy the image pixel data to the cut canvas
   const maskPixelData = maskImageData.data;
   const imagePixelData = imageInput.data;
+
   for (let i = 0; i < w * h; ++i) {
     const sourceOffset = 3 * i; // RGB
     const targetOffset = 4 * i; // RGBA
 
     if (maskPixelData[targetOffset + 3] > 0) {
-      // Only copy opaque pixels
       for (let j = 0; j < 3; ++j) {
         maskPixelData[targetOffset + j] = imagePixelData[sourceOffset + j];
       }
     }
   }
+
   cutContext.putImageData(maskImageData, 0, 0);
 
-  // Download image
   const link = document.createElement("a");
   link.download = "image.png";
   link.href = URL.createObjectURL(await cutCanvas.convertToBlob());
@@ -395,16 +276,50 @@ cutButton.addEventListener("click", async () => {
 });
 
 // ===============================
-// LOAD MODEL
+// SMART MODEL LOADER (webgpu fp16 -> webgpu fp32 -> cpu fp32)
 // ===============================
 const model_id = "Xenova/slimsam-77-uniform";
 statusLabel.textContent = "Loading model...";
-const model = await SamModel.from_pretrained(model_id, {
-  dtype: "fp16", // or "fp32"
-  device: "webgpu",
-});
+
+async function loadModelSmart() {
+  // Try WebGPU fp16
+  try {
+    const m = await SamModel.from_pretrained(model_id, {
+      dtype: "fp16",
+      device: "webgpu",
+    });
+    return { model: m, device: "webgpu", dtype: "fp16" };
+  } catch (e1) {
+    console.warn("WebGPU fp16 failed, trying WebGPU fp32...", e1);
+  }
+
+  // Try WebGPU fp32
+  try {
+    const m = await SamModel.from_pretrained(model_id, {
+      dtype: "fp32",
+      device: "webgpu",
+    });
+    return { model: m, device: "webgpu", dtype: "fp32" };
+  } catch (e2) {
+    console.warn("WebGPU fp32 failed, trying CPU fp32...", e2);
+  }
+
+  // CPU fallback (always)
+  const m = await SamModel.from_pretrained(model_id, {
+    dtype: "fp32",
+    device: "cpu",
+  });
+  return { model: m, device: "cpu", dtype: "fp32" };
+}
+
+const { model, device, dtype } = await loadModelSmart();
 const processor = await AutoProcessor.from_pretrained(model_id);
-statusLabel.textContent = "Ready";
+
+// Store globally for event handlers
+window.__samModel = model;
+window.__samProcessor = processor;
+
+statusLabel.textContent = `Ready (${device}, ${dtype})`;
 
 // Enable the user interface
 fileUpload.disabled = false;
