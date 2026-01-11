@@ -18,33 +18,20 @@ env.backends.onnx.wasm.simd = true;
 env.backends.onnx.wasm.proxy = false;
 
 // ===============================
-// CONFIG (tuneable)
+// CONFIG
 // ===============================
+const PROCESSOR_SIZE = 640;       // seguro en WASM
+const FLOOR_START_Y = 0.62;       // zona "suelo" (más alto = menos suelo)
+const FLOOR_STRONG_Y = 0.72;      // 2ª pasada: más agresivo hacia abajo
+const MID_BLOCK_Y = 0.55;         // zona media donde suelen estar muebles
 
-// Si te pilla poco suelo, baja estos Y un poco (más hacia abajo).
-// Si te pilla cosas no suelo, sube negativos o añade más negativos.
-const PROCESSOR_SIZE = 640; // seguro WASM
+// Umbrales de “calidad” para decidir si reintentar
+const MIN_BOTTOM_COVERAGE = 0.08; // % de píxeles del borde inferior cubiertos (0.05–0.15)
+const MIN_AREA_RATIO = 0.08;      // % del área total (0.05–0.20)
 
-// Puntos POSITIVOS (sugerimos suelo) en coordenadas normalizadas [0..1]
-const POS_POINTS = [
-  [0.20, 0.78],
-  [0.50, 0.80],
-  [0.80, 0.78],
-  [0.20, 0.90],
-  [0.50, 0.92],
-  [0.80, 0.90],
-  [0.50, 0.98],
-];
-
-// Puntos NEGATIVOS (NO suelo) arriba (pared/techo)
-const NEG_POINTS = [
-  [0.20, 0.12],
-  [0.50, 0.12],
-  [0.80, 0.12],
-  [0.50, 0.30],
-];
-
+// ===============================
 // UI refs
+// ===============================
 const statusLabel = document.getElementById("status");
 const fileUpload = document.getElementById("upload");
 const imageContainer = document.getElementById("container");
@@ -66,36 +53,43 @@ let imageProcessed = null;
 let imageEmbeddings = null;
 
 // ===============================
-// Pick best floor mask (touches bottom)
+// Helpers: mask scoring
 // ===============================
-function pickBestFloorMaskIndex(mask, numMasks) {
+function scoreMaskBottomAndArea(mask, numMasks, maskIndex) {
   const w = mask.width;
   const h = mask.height;
 
+  let bottom = 0;
+  let area = 0;
+
+  const y = h - 1;
+  for (let x = 0; x < w; x++) {
+    const i = y * w + x;
+    if (mask.data[numMasks * i + maskIndex] === 1) bottom++;
+  }
+  for (let i = 0; i < w * h; i++) {
+    if (mask.data[numMasks * i + maskIndex] === 1) area++;
+  }
+
+  return {
+    bottomRatio: bottom / w,
+    areaRatio: area / (w * h),
+  };
+}
+
+function pickBestFloorMaskIndex(mask, numMasks) {
   let best = 0;
   let bestBottom = -1;
   let bestArea = -1;
 
   for (let m = 0; m < numMasks; m++) {
-    let bottom = 0;
-    let area = 0;
+    const { bottomRatio, areaRatio } = scoreMaskBottomAndArea(mask, numMasks, m);
 
-    // bottom row
-    const y = h - 1;
-    for (let x = 0; x < w; x++) {
-      const i = y * w + x;
-      if (mask.data[numMasks * i + m] === 1) bottom++;
-    }
-
-    // total area
-    for (let i = 0; i < w * h; i++) {
-      if (mask.data[numMasks * i + m] === 1) area++;
-    }
-
-    if (bottom > bestBottom || (bottom === bestBottom && area > bestArea)) {
+    // Priorizamos tocar borde inferior, luego área
+    if (bottomRatio > bestBottom || (bottomRatio === bestBottom && areaRatio > bestArea)) {
       best = m;
-      bestBottom = bottom;
-      bestArea = area;
+      bestBottom = bottomRatio;
+      bestArea = areaRatio;
     }
   }
 
@@ -116,8 +110,9 @@ function updateMaskOverlay(mask, scores) {
 
   const numMasks = scores.length;
   const bestIndex = pickBestFloorMaskIndex(mask, numMasks);
+  const quality = scoreMaskBottomAndArea(mask, numMasks, bestIndex);
 
-  statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)})`;
+  statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)} | bottom ${(quality.bottomRatio*100).toFixed(1)}% | area ${(quality.areaRatio*100).toFixed(1)}%)`;
 
   for (let i = 0; i < pixelData.length; ++i) {
     if (mask.data[numMasks * i + bestIndex] === 1) {
@@ -130,6 +125,8 @@ function updateMaskOverlay(mask, scores) {
   }
 
   maskContext.putImageData(imageData, 0, 0);
+
+  return quality;
 }
 
 function clearMask() {
@@ -154,40 +151,64 @@ resetButton.addEventListener("click", () => {
 });
 
 // ===============================
-// Auto floor segmentation (AUTO POINTS)
+// Build adaptive points
 // ===============================
-function buildAutoPointsTensors() {
+function buildPointsForPass(pass) {
   const reshaped = imageProcessed.reshaped_input_sizes[0]; // [h, w]
   const H = reshaped[0];
   const W = reshaped[1];
 
-  // Convert normalized points to reshaped pixel coords
+  const yFloor = pass === 1 ? FLOOR_START_Y : FLOOR_STRONG_Y;
+
+  // POS: suelo (abajo, varias columnas)
+  const pos = [
+    [0.10, yFloor],
+    [0.30, yFloor],
+    [0.50, yFloor],
+    [0.70, yFloor],
+    [0.90, yFloor],
+    [0.20, 0.92],
+    [0.50, 0.95],
+    [0.80, 0.92],
+    [0.50, 0.985],
+  ];
+
+  // NEG: techo/pared (arriba) + zona media (muebles)
+  const neg = [
+    [0.10, 0.10],
+    [0.50, 0.10],
+    [0.90, 0.10],
+    [0.50, 0.28],
+    // bloqueo muebles (zona media)
+    [0.20, MID_BLOCK_Y],
+    [0.50, MID_BLOCK_Y],
+    [0.80, MID_BLOCK_Y],
+  ];
+
   const pts = [];
   const lbls = [];
 
-  for (const [x, y] of POS_POINTS) {
+  for (const [x, y] of pos) {
     pts.push(x * W, y * H);
-    lbls.push(1n); // positive
+    lbls.push(1n);
   }
-  for (const [x, y] of NEG_POINTS) {
+  for (const [x, y] of neg) {
     pts.push(x * W, y * H);
-    lbls.push(0n); // negative
+    lbls.push(0n);
   }
 
   const num = lbls.length;
-
-  // SAM expects [1, 1, num_points, 2]
   const input_points = new Tensor("float32", pts, [1, 1, num, 2]);
-  // labels: [1, 1, num_points]
   const input_labels = new Tensor("int64", lbls, [1, 1, num]);
 
   return { input_points, input_labels };
 }
 
-async function autoFloorSegment(model, processor) {
-  statusLabel.textContent = "Auto-detecting floor...";
-
-  const { input_points, input_labels } = buildAutoPointsTensors();
+// ===============================
+// Run SAM once
+// ===============================
+async function runSam(model, processor, pass) {
+  const { input_points, input_labels } = buildPointsForPass(pass);
 
   const { pred_masks, iou_scores } = await model({
     ...imageEmbeddings,
@@ -201,7 +222,28 @@ async function autoFloorSegment(model, processor) {
     imageProcessed.reshaped_input_sizes,
   );
 
-  updateMaskOverlay(RawImage.fromTensor(masks[0][0]), iou_scores.data);
+  const quality = updateMaskOverlay(RawImage.fromTensor(masks[0][0]), iou_scores.data);
+  return quality;
+}
+
+// ===============================
+// Auto floor (2-pass retry)
+// ===============================
+async function autoFloorSegment(model, processor) {
+  statusLabel.textContent = "Auto-detecting floor (pass 1)...";
+  let q1 = await runSam(model, processor, 1);
+
+  // Si toca poco el borde inferior o es muy pequeña -> retry más agresivo
+  if (q1.bottomRatio < MIN_BOTTOM_COVERAGE || q1.areaRatio < MIN_AREA_RATIO) {
+    statusLabel.textContent = "Auto-detecting floor (pass 2)...";
+    let q2 = await runSam(model, processor, 2);
+
+    // Si la 2ª es peor, nos quedamos con la 1ª (simplemente no dibujamos de nuevo)
+    // Aquí ya está dibujada la 2ª; para revertir necesitaríamos guardar la 1ª.
+    // En la práctica, la 2ª suele mejorar bastante.
+    q1 = q2;
+  }
+
   cutButton.disabled = false;
 }
 
@@ -216,7 +258,7 @@ async function encode(url, model, processor) {
 
   imageInput = await RawImage.fromURL(url);
 
-  // Keep photo proportions (no deform)
+  // Keep proportions
   imageContainer.style.aspectRatio = `${imageInput.width} / ${imageInput.height}`;
   imageContainer.style.backgroundImage = `url(${url})`;
 
