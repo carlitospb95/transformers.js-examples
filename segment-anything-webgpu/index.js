@@ -9,17 +9,12 @@ import {
 // ===============================
 // FORCE WASM BACKEND (IMPORTANT)
 // ===============================
-// Evita el error "no available backend found" cuando WebGPU no existe.
 env.allowLocalModels = false;
-
-// Fuerza uso de WASM (ONNX Runtime Web). Esto hace que NO dependa de WebGPU.
 env.backends = env.backends || {};
 env.backends.onnx = env.backends.onnx || {};
 env.backends.onnx.wasm = env.backends.onnx.wasm || {};
-
-// Opciones seguras
-env.backends.onnx.wasm.numThreads = 1;      // en móvil/portátil evita problemas
-env.backends.onnx.wasm.simd = true;         // si el navegador soporta SIMD, acelera
+env.backends.onnx.wasm.numThreads = 1;
+env.backends.onnx.wasm.simd = true;
 env.backends.onnx.wasm.proxy = false;
 
 // ===============================
@@ -27,7 +22,7 @@ env.backends.onnx.wasm.proxy = false;
 // ===============================
 const AUTO_FLOOR_MODE = true;
 const FLOOR_Y_START = 0.45;
-const PROCESSOR_SIZE = 640; // más seguro para WASM (sube a 768 si va fluido)
+const PROCESSOR_SIZE = 640; // seguro para WASM (sube a 768 si va fluido)
 
 // UI refs
 const statusLabel = document.getElementById("status");
@@ -65,12 +60,14 @@ function pickBestFloorMaskIndex(mask, numMasks) {
     let bottom = 0;
     let area = 0;
 
+    // bottom row
     const y = h - 1;
     for (let x = 0; x < w; x++) {
       const i = y * w + x;
       if (mask.data[numMasks * i + m] === 1) bottom++;
     }
 
+    // area
     for (let i = 0; i < w * h; i++) {
       if (mask.data[numMasks * i + m] === 1) area++;
     }
@@ -98,7 +95,7 @@ function updateMaskOverlay(mask, scores) {
   const pixelData = imageData.data;
 
   const numMasks = scores.length;
-  let bestIndex = pickBestFloorMaskIndex(mask, numMasks);
+  const bestIndex = pickBestFloorMaskIndex(mask, numMasks);
 
   statusLabel.textContent = `Auto-floor mask (score: ${scores[bestIndex].toFixed(2)})`;
 
@@ -131,17 +128,18 @@ resetButton.addEventListener("click", () => {
 
   cutButton.disabled = true;
   imageContainer.style.backgroundImage = "none";
+  imageContainer.style.aspectRatio = ""; // reset
   uploadButton.style.display = "flex";
   statusLabel.textContent = "Ready";
 });
 
 // ===============================
-// Auto floor segmentation (box prompt)
+// Auto floor segmentation (box prompt + empty points)
 // ===============================
 async function autoFloorSegment(model, processor) {
   statusLabel.textContent = "Auto-detecting floor...";
 
-  const reshaped = imageProcessed.reshaped_input_sizes[0];
+  const reshaped = imageProcessed.reshaped_input_sizes[0]; // [h, w]
   const H = reshaped[0];
   const W = reshaped[1];
 
@@ -152,9 +150,16 @@ async function autoFloorSegment(model, processor) {
 
   const input_boxes = new Tensor("float32", [x0, y0, x1, y1], [1, 1, 2, 2]);
 
+  // ✅ FIX: SlimSAM requiere input_points + input_labels siempre.
+  // Pasamos 0 puntos (tensores vacíos) para que no falle.
+  const input_points = new Tensor("float32", [], [1, 1, 0, 2]);
+  const input_labels = new Tensor("int64", [], [1, 1, 0]);
+
   const { pred_masks, iou_scores } = await model({
     ...imageEmbeddings,
     input_boxes,
+    input_points,
+    input_labels,
   });
 
   const masks = await processor.post_process_masks(
@@ -178,6 +183,9 @@ async function encode(url, model, processor) {
 
   imageInput = await RawImage.fromURL(url);
 
+  // ✅ Mantener proporciones (evita deformación en vertical/horizontal)
+  imageContainer.style.aspectRatio = `${imageInput.width} / ${imageInput.height}`;
+
   imageContainer.style.backgroundImage = `url(${url})`;
   uploadButton.style.display = "none";
   cutButton.disabled = true;
@@ -195,7 +203,9 @@ async function encode(url, model, processor) {
   isEncoding = false;
 
   clearMask();
-  await autoFloorSegment(model, processor);
+  if (AUTO_FLOOR_MODE) {
+    await autoFloorSegment(model, processor);
+  }
 }
 
 // Upload handlers
